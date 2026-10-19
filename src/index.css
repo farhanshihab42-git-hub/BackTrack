@@ -1,0 +1,45 @@
+:root {
+  --ink: #20352d;
+  --pine: #315d4d;
+  --coral: #d17a4d;
+  --line: #dfe6df;
+  --surface: #fff;
+  --focus: #b05d3b;
+  --sans: Aptos, 'Segoe UI', sans-serif;
+  --display: Georgia, 'Times New Roman', serif;
+
+  font: 14px/1.5 var(--sans);
+  color: var(--ink);
+  background: #eef2ee;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* { box-sizing: border-box; }
+
+html { min-width: 320px; min-height: 100%; }
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+}
+
+#root { min-height: 100vh; }
+
+button,
+input,
+select { font: inherit; }
+
+button { letter-spacing: 0; }
+
+h1,
+h2,
+h3,
+p { margin-top: 0; }
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+}
