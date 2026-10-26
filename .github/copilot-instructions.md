@@ -102,3 +102,8 @@ Before starting a new task in the above plan, update progress in the plan.
 - Work through each checklist item systematically.
 - Keep communication concise and focused.
 - Follow development best practices.
+
+## Thesis App Requirements
+- Treat `REQUIREMENTS.md` as the source of truth for target roles, workflows, security, data, and acceptance tests.
+- Never present client-side view switching as authentication or authorization; real access control must be enforced by the backend and database.
+- Do not use identifiable or real patient data in the browser-only prototype.

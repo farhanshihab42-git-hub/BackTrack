@@ -1,342 +1,504 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
+import {
+  DIRECTIONS,
+  CONTACT_CLINICIAN_GUIDANCE,
+  MODALITY_GUIDANCE,
+  PROGRAMMES,
+  URGENT_SYMPTOMS,
+  getProgrammeForOdi,
+  type Direction,
+  type OdiScores,
+  type Programme,
+} from './protocol'
 import './App.css'
 
-type Exercise = {
+type Session = {
   id: string
-  name: string
-  sets: number
-  amount: number
-  unit: 'reps' | 'seconds'
-}
-
-type Protocol = {
-  days: number[]
-  exercises: Exercise[]
-}
-
-type CheckIn = {
   date: string
-  status: 'completed' | 'missed'
-  dose: Record<string, number>
-  plannedDose: Record<string, number>
-  effort?: number
-  reason?: string
+  programme: Programme
+  direction: Direction | null
+  slot: string
+  kind: 'standard' | 'aerobic' | 'strength'
+  completedExerciseIds: string[]
+  painBefore: number
+  painAfter: number
+  stopFlags: string[]
+  status: 'completed' | 'partial' | 'stopped' | 'missed'
 }
 
 type Participant = {
   id: string
-  protocol: Protocol
-  logs: CheckIn[]
+  baselineOdi: OdiScores | null
+  finalOdi: OdiScores | null
+  direction: Direction | null
+  programme: Programme | null
+  clinicalNote: string
+  programmeStartedAt: string | null
+  startedAt: string | null
+  sessions: Session[]
 }
 
-type View = 'patient' | 'research'
+type StudyState = { participants: Participant[]; selectedId: string }
+type View = 'patient' | 'physiotherapist' | 'research'
+type SessionDraft = {
+  completedExerciseIds: string[]
+  painBefore: number
+  painAfter: number
+  urgentFlags: string[]
+  stopFlags: string[]
+}
 
-const STORAGE_KEY = 'backtrack-study-prototype-v1'
-const WEEKDAYS = [
-  { label: 'Mon', day: 1 },
-  { label: 'Tue', day: 2 },
-  { label: 'Wed', day: 3 },
-  { label: 'Thu', day: 4 },
-  { label: 'Fri', day: 5 },
-  { label: 'Sat', day: 6 },
-  { label: 'Sun', day: 0 },
+const STORAGE_KEY = 'backtrack-protocol-demo-v3'
+const PRACTICE_FIRST_WEEK_DAYS = 7
+const MINIMUM_PROGRAMME_DAYS = 14
+const DAILY_STOP_FLAGS = [
+  'Pain rises by 2 or more points, or goes above 7/10',
+  'Pain spreads further down the buttock or leg',
+  'New pins and needles, numbness, or leg weakness',
+  'Dizziness, chest pain, or unusual breathlessness',
+  'Skin burning or irritation from a modality',
 ]
 
-function dateAtOffset(offset: number, baseDate: Date) {
-  const date = new Date(baseDate)
-  date.setHours(12, 0, 0, 0)
-  date.setDate(date.getDate() + offset)
-  return date
-}
+const SECTION_LABELS = Array.from({ length: 10 }, (_, index) => `Section ${index + 1}`)
 
 function dateKey(date: Date) {
-  const year = date.getFullYear()
-  const month = String(date.getMonth() + 1).padStart(2, '0')
-  const day = String(date.getDate()).padStart(2, '0')
-  return `${year}-${month}-${day}`
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+}
+
+function parseDate(value: string) {
+  return new Date(`${value}T12:00:00`)
+}
+
+function daysBetween(start: string, end: string) {
+  return Math.floor((parseDate(end).getTime() - parseDate(start).getTime()) / 86_400_000)
 }
 
 function dateLabel(date: Date, options: Intl.DateTimeFormatOptions) {
   return new Intl.DateTimeFormat('en', options).format(date)
 }
 
-function plannedDoseFor(protocol: Protocol) {
-  return Object.fromEntries(
-    protocol.exercises.map((exercise) => [
-      exercise.id,
-      exercise.sets * exercise.amount,
-    ]),
-  )
+function demoScores(sum: number): OdiScores {
+  const values = Array.from({ length: 10 }, () => 0)
+  for (let index = 0; index < values.length && sum > 0; index += 1) {
+    const value = Math.min(5, sum)
+    values[index] = value
+    sum -= value
+  }
+  return values
 }
 
-function createDemoParticipant(
+function createParticipant(
   id: string,
-  days: number[],
-  exercises: Exercise[],
-  seed: number,
-  baseDate: Date,
+  score: number | null = null,
+  programme: Programme | null = null,
+  direction: Direction | null = null,
 ): Participant {
-  const protocol = { days, exercises }
-  const plannedDose = plannedDoseFor(protocol)
-  const logs: CheckIn[] = []
-
-  for (let offset = -41; offset < 0; offset += 1) {
-    const date = dateAtOffset(offset, baseDate)
-    if (!days.includes(date.getDay())) continue
-
-    const completed = (date.getDate() + seed) % 5 !== 0
-    const dose = Object.fromEntries(
-      exercises.map((exercise) => {
-        const target = plannedDose[exercise.id]
-        const completion = completed
-          ? (date.getDate() + seed) % 4 === 0
-            ? 0.75
-            : 1
-          : 0
-        return [exercise.id, Math.round(target * completion)]
-      }),
-    )
-
-    logs.push({
-      date: dateKey(date),
-      status: completed ? 'completed' : 'missed',
-      dose,
-      plannedDose,
-      effort: completed ? 2 + ((date.getDate() + seed) % 3) : undefined,
-      reason: completed ? undefined : 'Schedule conflict',
-    })
-  }
-
-  return { id, protocol, logs }
-}
-
-function createDemoParticipants(): Participant[] {
-  const baseDate = new Date()
-  return [
-    createDemoParticipant(
-      'P-014',
-      [1, 3, 5],
-      [
-        { id: 'ex-bridge', name: 'Glute bridge', sets: 3, amount: 10, unit: 'reps' },
-        { id: 'ex-bird-dog', name: 'Bird dog', sets: 2, amount: 8, unit: 'reps' },
-        { id: 'ex-mobility', name: 'Knee-to-chest', sets: 2, amount: 20, unit: 'seconds' },
-      ],
-      2,
-      baseDate,
-    ),
-    createDemoParticipant(
-      'P-021',
-      [2, 4, 6],
-      [
-        { id: 'ex-hinge', name: 'Hip hinge', sets: 3, amount: 8, unit: 'reps' },
-        { id: 'ex-bird-dog-2', name: 'Bird dog', sets: 2, amount: 8, unit: 'reps' },
-      ],
-      4,
-      baseDate,
-    ),
-    createDemoParticipant(
-      'P-027',
-      [1, 4],
-      [
-        { id: 'ex-rotation', name: 'Open book rotation', sets: 2, amount: 8, unit: 'reps' },
-        { id: 'ex-mobility-2', name: 'Knee-to-chest', sets: 2, amount: 20, unit: 'seconds' },
-      ],
-      1,
-      baseDate,
-    ),
-  ]
-}
-
-function readParticipants(): Participant[] {
-  try {
-    const saved = localStorage.getItem(STORAGE_KEY)
-    if (saved) {
-      const parsed: unknown = JSON.parse(saved)
-      if (Array.isArray(parsed) && parsed.length > 0) return parsed as Participant[]
-    }
-  } catch {
-    // Fall back to the non-identifiable demo cohort if storage is unavailable.
-  }
-  return createDemoParticipants()
-}
-
-function getWeekSummary(participant: Participant, today: Date) {
-  const dates = Array.from({ length: 7 }, (_, index) => dateAtOffset(index - 6, today))
-    .filter((date) => participant.protocol.days.includes(date.getDay()))
-  const scheduled = dates.length
-  const logs = new Map(participant.logs.map((log) => [log.date, log]))
-  const completed = dates.filter((date) => logs.get(dateKey(date))?.status === 'completed').length
-  const plannedExerciseSessions = scheduled * participant.protocol.exercises.length
-  const actual = dates.reduce((total, date) => {
-    const log = logs.get(dateKey(date))
-    if (!log || log.status !== 'completed') return total
-    return total + participant.protocol.exercises.reduce((sessionTotal, exercise) => {
-      const target = exercise.sets * exercise.amount
-      if (target <= 0) return sessionTotal
-      const reported = Math.min(Math.max(log.dose[exercise.id] ?? 0, 0), target)
-      return sessionTotal + reported / target
-    }, 0)
-  }, 0)
-
+  const today = dateKey(new Date())
+  const scores = score === null ? null : demoScores(score)
   return {
-    scheduled,
-    completed,
-    sessionRate: scheduled === 0 ? null : Math.round((completed / scheduled) * 100),
-    doseRate: plannedExerciseSessions === 0
-      ? null
-      : Math.round((actual / plannedExerciseSessions) * 100),
+    id,
+    baselineOdi: scores,
+    finalOdi: null,
+    direction,
+    programme,
+    clinicalNote: '',
+    programmeStartedAt: programme ? today : null,
+    startedAt: programme ? today : null,
+    sessions: [],
   }
 }
 
-function getTrend(participant: Participant, today: Date) {
-  const currentWeek = new Date(today)
-  currentWeek.setHours(12, 0, 0, 0)
-  currentWeek.setDate(currentWeek.getDate() - ((currentWeek.getDay() + 6) % 7))
-  const logs = new Map(participant.logs.map((log) => [log.date, log]))
+function createInitialState(): StudyState {
+  return {
+    participants: [
+      createParticipant('P-014', 26, 'B', 'Extension'),
+      createParticipant('P-021', 16, 'C', 'Flexion'),
+      createParticipant('P-027', 6, 'D', 'Lateral'),
+    ],
+    selectedId: 'P-014',
+  }
+}
 
-  return Array.from({ length: 6 }, (_, index) => {
-    const start = new Date(currentWeek)
-    start.setDate(start.getDate() - (5 - index) * 7)
-    const dates = Array.from({ length: 7 }, (_, day) => {
-      const date = new Date(start)
-      date.setDate(start.getDate() + day)
-      return date
-    }).filter(
-      (date) =>
-        date <= today && participant.protocol.days.includes(date.getDay()),
-    )
-    const completed = dates.filter((date) => logs.get(dateKey(date))?.status === 'completed').length
-    return {
-      label: dateLabel(start, { month: 'short', day: 'numeric' }),
-      rate: dates.length === 0 ? null : Math.round((completed / dates.length) * 100),
-      count: completed,
-      total: dates.length,
+function readState(): StudyState {
+  const saved = localStorage.getItem(STORAGE_KEY)
+  if (saved) {
+    const parsed: unknown = JSON.parse(saved)
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      'participants' in parsed &&
+      Array.isArray(parsed.participants) &&
+      parsed.participants.length > 0 &&
+      'selectedId' in parsed &&
+      typeof parsed.selectedId === 'string'
+    ) {
+      return parsed as StudyState
     }
+  }
+  return createInitialState()
+}
+
+function getOdiResult(scores: OdiScores | null) {
+  if (!scores) return null
+  const answered = scores.filter((score): score is number => score !== null)
+  if (answered.length < 9) return null
+  const percentage = Math.round((answered.reduce((sum, score) => sum + score, 0) / (answered.length * 5)) * 100)
+  return { percentage, programme: getProgrammeForOdi(scores), answered: answered.length }
+}
+
+function programmeNumber(programme: Programme) {
+  return PROGRAMMES.findIndex((item) => item.id === programme)
+}
+
+function sessionTarget(programme: Programme) {
+  return programme === 'A' ? 14 : programme === 'B' ? 6 : programme === 'C' ? 5 : 5
+}
+
+function exercisesForSession(
+  programme: Programme,
+  direction: Direction | null,
+  kind: Session['kind'],
+) {
+  const program = PROGRAMMES[programmeNumber(programme)]
+  const exercises = program.exercises.filter((exercise) => {
+    if (exercise.id === 'D8') return false
+    if (!exercise.sessionKind) return true
+    return kind === 'strength' || exercise.sessionKind === 'aerobic'
   })
+  if (direction && direction !== 'None') {
+    const preference = program.preference[direction]
+    if (preference) {
+      exercises.push({
+        id: preference.id,
+        name: preference.name,
+        instructions: preference.instructions,
+        dose: program.preferenceDose,
+        optional: programme === 'D',
+      })
+    }
+  }
+  return exercises
+}
+
+function getProgression(participant: Participant, sessions: Session[], today: string) {
+  if (!participant.programme || !participant.programmeStartedAt) return null
+  const currentIndex = programmeNumber(participant.programme)
+  if (currentIndex < 0 || currentIndex >= PROGRAMMES.length - 1) return null
+  if (daysBetween(participant.programmeStartedAt, today) < MINIMUM_PROGRAMME_DAYS) return null
+
+  const currentSessions = sessions
+    .filter((session) => session.programme === participant.programme && session.status === 'completed')
+    .sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id))
+  const latestThree = currentSessions.slice(-3)
+  if (latestThree.length < 3 || latestThree.some((session) => session.stopFlags.length > 0)) return null
+  const programmeExercises = PROGRAMMES[currentIndex].exercises.filter((exercise) => !exercise.optional)
+  if (latestThree.some((session) => {
+    const preferenceId = session.direction && session.direction !== 'None'
+      ? PROGRAMMES[currentIndex].preference[session.direction]?.id
+      : undefined
+    const requiredExerciseIds = [
+      ...programmeExercises.map((exercise) => exercise.id),
+      ...(preferenceId && participant.programme !== 'D' ? [preferenceId] : []),
+    ]
+    return requiredExerciseIds.some((id) => !session.completedExerciseIds.includes(id))
+  })) return null
+
+  const start = participant.programmeStartedAt
+  const firstWeek = currentSessions.filter((session) =>
+    daysBetween(start, session.date) >= 0 && daysBetween(start, session.date) < PRACTICE_FIRST_WEEK_DAYS,
+  )
+  if (firstWeek.length === 0) return null
+  const firstWeekAverage = firstWeek.reduce((sum, session) => sum + session.painBefore, 0) / firstWeek.length
+  const recentAverage = latestThree.reduce((sum, session) => sum + session.painBefore, 0) / latestThree.length
+  const painImproved = recentAverage <= firstWeekAverage - 2 || recentAverage <= 3
+  const noSignificantPostPainRise = latestThree.every((session) => session.painAfter < session.painBefore + 2)
+  return painImproved && noSignificantPostPainRise ? PROGRAMMES[currentIndex + 1].id : null
+}
+
+function CheckList({
+  title,
+  items,
+  values,
+  onChange,
+}: {
+  title: string
+  items: string[]
+  values: string[]
+  onChange: (values: string[]) => void
+}) {
+  return (
+    <fieldset className="check-list">
+      <legend>{title}</legend>
+      {items.map((item) => (
+        <label className="check-item" key={item}>
+          <input
+            type="checkbox"
+            checked={values.includes(item)}
+            onChange={(event) => onChange(
+              event.target.checked ? [...values, item] : values.filter((value) => value !== item),
+            )}
+          />
+          <span>{item}</span>
+        </label>
+      ))}
+    </fieldset>
+  )
 }
 
 function App() {
-  const [participants, setParticipants] = useState(readParticipants)
-  const [selectedId, setSelectedId] = useState('P-014')
+  const [state, setState] = useState(readState)
   const [view, setView] = useState<View>('patient')
-  const selected = participants.find((participant) => participant.id === selectedId) ?? participants[0]
+  const [programmeDraft, setProgrammeDraft] = useState<Programme>('B')
+  const [directionDraft, setDirectionDraft] = useState<Direction>('Extension')
+  const [clinicalNoteDraft, setClinicalNoteDraft] = useState('')
+  const [odiDraft, setOdiDraft] = useState<OdiScores>(Array(10).fill(null))
+  const [finalOdiDraft, setFinalOdiDraft] = useState<OdiScores>(Array(10).fill(null))
+  const [showFinalOdi, setShowFinalOdi] = useState(false)
+  const [sessionDrafts, setSessionDrafts] = useState<Record<string, SessionDraft>>({})
+  const [slot, setSlot] = useState('Morning')
+  const [sessionKind, setSessionKind] = useState<'aerobic' | 'strength'>('strength')
+  const [notice, setNotice] = useState('')
   const [today] = useState(() => new Date())
   const todayKey = dateKey(today)
-  const todayLog = selected.logs.find((log) => log.date === todayKey)
-  const [doseDraft, setDoseDraft] = useState<Record<string, number>>(() =>
-    todayLog?.dose ?? Object.fromEntries(selected.protocol.exercises.map((exercise) => [exercise.id, 0])),
+  const selected = state.participants.find((participant) => participant.id === state.selectedId) ?? state.participants[0]
+  const odiResult = getOdiResult(odiDraft)
+  const finalOdiResult = getOdiResult(finalOdiDraft)
+  const currentProgramme = selected.programme
+    ? PROGRAMMES[programmeNumber(selected.programme)]
+    : null
+  const eligibleNextProgramme = getProgression(selected, selected.sessions, todayKey)
+  const selectedSession = selected.sessions.find((session) => session.date === todayKey && session.slot === slot)
+  const sessionDraftKey = `${selected.id}-${slot}`
+  const sessionDraft = sessionDrafts[sessionDraftKey] ?? {
+    completedExerciseIds: selectedSession?.completedExerciseIds ?? [],
+    painBefore: selectedSession?.painBefore ?? 0,
+    painAfter: selectedSession?.painAfter ?? 0,
+    urgentFlags: [],
+    stopFlags: selectedSession?.stopFlags ?? [],
+  }
+  const activeExercises = currentProgramme
+    ? exercisesForSession(currentProgramme.id, selected.direction, selected.programme === 'D' ? sessionKind : 'standard')
+    : []
+  const selectedPreference = selected.direction && selected.direction !== 'None'
+    ? currentProgramme?.preference[selected.direction]
+    : undefined
+  const lastSevenDays = selected.sessions.filter((session) =>
+    daysBetween(session.date, todayKey) >= 0 && daysBetween(session.date, todayKey) < 7,
   )
-  const [effort, setEffort] = useState(todayLog?.effort ?? 3)
-  const [missReason, setMissReason] = useState(todayLog?.reason ?? 'Schedule conflict')
-  const [editingCheckIn, setEditingCheckIn] = useState(false)
-  const summary = getWeekSummary(selected, today)
-  const trend = getTrend(selected, today)
-  const todayScheduled = selected.protocol.days.includes(today.getDay())
+  const adherenceCount = lastSevenDays.filter((session) => session.status === 'completed').length
+  const adherenceTarget = currentProgramme ? sessionTarget(currentProgramme.id) : 0
+  const adherenceRate = adherenceTarget ? Math.min(100, Math.round((adherenceCount / adherenceTarget) * 100)) : 0
+  const metricExercises = selectedSession
+    ? exercisesForSession(selectedSession.programme, selectedSession.direction, selectedSession.kind)
+    : activeExercises
+  const requiredExerciseCount = metricExercises.filter((exercise) => !exercise.optional).length
+  const recordedExerciseIds = selectedSession?.completedExerciseIds ?? sessionDraft.completedExerciseIds
+  const exerciseTickCount = metricExercises.filter((exercise) =>
+    !exercise.optional && recordedExerciseIds.includes(exercise.id),
+  ).length
+  const exerciseTickRate = requiredExerciseCount
+    ? Math.round((Math.min(exerciseTickCount, requiredExerciseCount) / requiredExerciseCount) * 100)
+    : 0
 
-  useEffect(() => {
+  function commitState(nextState: StudyState) {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(participants))
-    } catch {
-      // The prototype remains usable for this session if storage is unavailable.
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(nextState))
+    } catch (error) {
+      console.error('Unable to persist BackTrack demo data in browser storage.', error)
+      setNotice('Could not save this demo data in browser storage.')
     }
-  }, [participants])
+    setState(nextState)
+  }
 
-  function selectParticipant(id: string) {
-    const participant = participants.find((item) => item.id === id)
-    if (!participant) return
-    const checkIn = participant.logs.find((log) => log.date === todayKey)
-    setDoseDraft(checkIn?.dose ?? Object.fromEntries(
-      participant.protocol.exercises.map((exercise) => [exercise.id, 0]),
-    ))
-    setEffort(checkIn?.effort ?? 3)
-    setMissReason(checkIn?.reason ?? 'Schedule conflict')
-    setEditingCheckIn(false)
-    setSelectedId(id)
+  function updateSessionDraft(patch: Partial<SessionDraft>) {
+    setSessionDrafts((current) => ({
+      ...current,
+      [sessionDraftKey]: { ...sessionDraft, ...patch },
+    }))
   }
 
   function updateSelected(update: (participant: Participant) => Participant) {
-    setParticipants((current) =>
-      current.map((participant) =>
-        participant.id === selectedId ? update(participant) : participant,
+    commitState({
+      ...state,
+      participants: state.participants.map((participant) =>
+        participant.id === selected.id ? update(participant) : participant,
       ),
-    )
+    })
   }
 
-  function saveCheckIn(status: CheckIn['status']) {
-    const plannedDose = plannedDoseFor(selected.protocol)
-    const dose = status === 'completed'
-      ? Object.fromEntries(
-          Object.entries(plannedDose).map(([id, target]) => [
-            id,
-            Math.min(Math.max(doseDraft[id] ?? 0, 0), target),
-          ]),
-        )
-      : Object.fromEntries(Object.keys(plannedDose).map((id) => [id, 0]))
-    const log: CheckIn = {
+  function selectParticipant(id: string) {
+    commitState({ ...state, selectedId: id })
+    const participant = state.participants.find((item) => item.id === id)
+    if (participant) {
+      setOdiDraft(participant.baselineOdi ?? Array(10).fill(null))
+      setFinalOdiDraft(participant.finalOdi ?? Array(10).fill(null))
+      setShowFinalOdi(false)
+      setProgrammeDraft(participant.programme ?? 'B')
+      setDirectionDraft(participant.direction ?? 'Extension')
+      setClinicalNoteDraft(participant.clinicalNote)
+    }
+    setNotice('')
+  }
+
+  function switchView(nextView: View) {
+    setView(nextView)
+    if (nextView === 'patient') {
+      selectParticipant('P-014')
+    }
+  }
+
+  function previewPatient(selectedId: string) {
+    selectParticipant(selectedId)
+    setView('patient')
+  }
+
+  function updateOdiScore(
+    setter: (scores: OdiScores) => void,
+    scores: OdiScores,
+    index: number,
+    value: string,
+  ) {
+    const score = value === '' ? null : Number(value)
+    setter(scores.map((current, itemIndex) => itemIndex === index ? score : current))
+  }
+
+  function saveBaseline() {
+    if (!odiResult) {
+      setNotice('Enter scores for at least 9 of 10 ODI sections. Use only the ODI form approved for your study.')
+      return
+    }
+    updateSelected((participant) => ({ ...participant, baselineOdi: odiDraft }))
+    setNotice(odiResult.percentage > 80
+      ? 'Baseline ODI saved. The protocol draft marks 81–100% as outside enrollment; the physiotherapist demo cannot override study eligibility.'
+      : `Baseline ODI ${odiResult.percentage}% saved. A physiotherapist must assign the demonstration programme and direction.`)
+  }
+
+  function assignPlan() {
+    const result = getOdiResult(selected.baselineOdi)
+    if (result && result.percentage > 80) {
+      setNotice('This synthetic participant is outside the draft enrollment range (ODI 81–100%); no programme can be assigned.')
+      return
+    }
+    updateSelected((participant) => ({
+      ...participant,
+      programme: programmeDraft,
+      direction: directionDraft,
+      clinicalNote: clinicalNoteDraft,
+      programmeStartedAt: participant.programme === programmeDraft && participant.programmeStartedAt
+        ? participant.programmeStartedAt
+        : todayKey,
+      startedAt: participant.startedAt ?? todayKey,
+    }))
+    setNotice(`Demo plan assigned: Programme ${programmeDraft}, ${directionDraft} preference. This action is not clinically approved or audited.`)
+  }
+
+  function saveSession(status: Session['status']) {
+    if (sessionDraft.urgentFlags.length > 0) {
+      setNotice('Do not exercise. The draft protocol says to seek urgent care for any checked warning sign.')
+      return
+    }
+    if (status === 'completed' && !selected.direction) {
+      setNotice('No physiotherapist-assigned direction is available for this participant.')
+      return
+    }
+    const id = `${todayKey}-${slot}`
+    const session: Session = {
+      id,
       date: todayKey,
-      status,
-      dose,
-      plannedDose,
-      effort: status === 'completed' ? effort : undefined,
-      reason: status === 'missed' ? missReason : undefined,
+      programme: selected.programme!,
+      direction: selected.direction,
+      slot,
+      kind: selected.programme === 'D' ? sessionKind : 'standard',
+      completedExerciseIds: status === 'completed' || status === 'partial' ? sessionDraft.completedExerciseIds : [],
+      painBefore: sessionDraft.painBefore,
+      painAfter: sessionDraft.painAfter,
+      stopFlags: sessionDraft.stopFlags,
+      status: sessionDraft.stopFlags.length > 0 ? 'stopped' : status,
     }
-
+    const sessions = [...selected.sessions.filter((item) => item.id !== id), session]
+    const nextProgramme = getProgression(selected, sessions, todayKey)
     updateSelected((participant) => ({
       ...participant,
-      logs: [...participant.logs.filter((item) => item.date !== todayKey), log],
+      sessions,
+      ...(nextProgramme ? { programme: nextProgramme, programmeStartedAt: todayKey } : {}),
     }))
-    setEditingCheckIn(false)
-  }
-
-  function updateProtocol(patch: Partial<Protocol>) {
-    updateSelected((participant) => ({
-      ...participant,
-      protocol: { ...participant.protocol, ...patch },
-    }))
-  }
-
-  function updateExercise(exerciseId: string, patch: Partial<Exercise>) {
-    updateProtocol({
-      exercises: selected.protocol.exercises.map((exercise) =>
-        exercise.id === exerciseId ? { ...exercise, ...patch } : exercise,
-      ),
-    })
-  }
-
-  function addExercise() {
-    const id = `exercise-${Date.now()}`
-    updateProtocol({
-      exercises: [
-        ...selected.protocol.exercises,
-        { id, name: '', sets: 2, amount: 8, unit: 'reps' },
-      ],
-    })
-  }
-
-  function addParticipant() {
-    const nextNumber = participants.reduce((max, participant) => {
-      const number = Number(participant.id.replace('P-', ''))
-      return Math.max(max, number)
-    }, 0) + 1
-    const participant: Participant = {
-      id: `P-${String(nextNumber).padStart(3, '0')}`,
-      protocol: {
-        days: [1, 3, 5],
-        exercises: [{ id: `exercise-${Date.now()}`, name: '', sets: 2, amount: 8, unit: 'reps' }],
-      },
-      logs: [],
+    if (sessionDraft.stopFlags.length > 0) {
+      setNotice('Session flagged as stopped. The draft protocol says to stop for these symptoms and contact a clinician or seek care as appropriate.')
+      return
     }
-    setParticipants((current) => [...current, participant])
-    setDoseDraft(Object.fromEntries(participant.protocol.exercises.map((exercise) => [exercise.id, 0])))
-    setEffort(3)
-    setMissReason('Schedule conflict')
-    setEditingCheckIn(false)
-    setSelectedId(participant.id)
-    setView('research')
+    setNotice(status === 'missed'
+      ? 'Missed session saved on this device.'
+      : nextProgramme
+        ? `Draft criteria met. Programme ${nextProgramme} is assigned for the next session automatically in this demo; this is not clinical approval.`
+        : status === 'partial'
+          ? 'Partial session saved. Exercise ticks and session completion are tracked separately.'
+          : 'Session saved on this device. Completion is self-reported.')
   }
 
-  const nextDay = WEEKDAYS.find((day) => day.day > today.getDay() && selected.protocol.days.includes(day.day))
-    ?? WEEKDAYS.find((day) => selected.protocol.days.includes(day.day))
+  function saveFinalOdi() {
+    if (!finalOdiResult) {
+      setNotice('Enter scores for at least 9 of 10 ODI sections.')
+      return
+    }
+    updateSelected((participant) => ({ ...participant, finalOdi: finalOdiDraft }))
+    setShowFinalOdi(false)
+    setNotice('End-of-course ODI saved. The comparison is a demo calculation only.')
+  }
+
+  function addSyntheticParticipant() {
+    const nextId = `P-${String(Math.max(0, ...state.participants.map((item) => Number(item.id.slice(2)) || 0)) + 1).padStart(3, '0')}`
+    const participant = createParticipant(nextId)
+    commitState({
+      participants: [...state.participants, participant],
+      selectedId: nextId,
+    })
+    setOdiDraft(Array(10).fill(null))
+    setSessionDrafts({})
+    setView('patient')
+    setNotice('Synthetic participant created. Enter baseline ODI and use the physiotherapist demo view to assign a plan.')
+  }
+
+  function exportSyntheticCsv() {
+    const header = ['participant_id', 'baseline_odi_percent', 'final_odi_percent', 'programme', 'direction', 'sessions_completed', 'sessions_partial_or_stopped', 'sessions_missed', 'latest_pain_before', 'latest_pain_after']
+    const rows = state.participants.map((participant) => {
+      const sessions = participant.sessions
+      const latest = [...sessions].sort((a, b) => b.date.localeCompare(a.date))[0]
+      return [
+        participant.id,
+        getOdiResult(participant.baselineOdi)?.percentage ?? '',
+        getOdiResult(participant.finalOdi)?.percentage ?? '',
+        participant.programme ?? '',
+        participant.direction ?? '',
+        sessions.filter((session) => session.status === 'completed').length,
+        sessions.filter((session) => session.status === 'partial' || session.status === 'stopped').length,
+        sessions.filter((session) => session.status === 'missed').length,
+        latest?.painBefore ?? '',
+        latest?.painAfter ?? '',
+      ]
+    })
+    const csv = [header, ...rows].map((row) => row.map((value) => `"${String(value).replaceAll('"', '""')}"`).join(',')).join('\r\n')
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }))
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = 'backtrack-synthetic-demo.csv'
+    anchor.click()
+    URL.revokeObjectURL(url)
+  }
+
+  function resetDemo() {
+    if (!window.confirm('Reset this browser demo to its synthetic sample data?')) return
+    const initial = createInitialState()
+    commitState(initial)
+    setOdiDraft(Array(10).fill(null))
+    setFinalOdiDraft(Array(10).fill(null))
+    setSessionDrafts({})
+    setNotice('Demo reset to synthetic sample data.')
+  }
+
+  const baselineResult = getOdiResult(selected.baselineOdi)
+  const finalResult = getOdiResult(selected.finalOdi)
+  const courseDays = selected.startedAt ? daysBetween(selected.startedAt, todayKey) : 0
+  const endOdiAvailable = courseDays >= 84
 
   return (
     <div className="app-shell">
@@ -345,156 +507,197 @@ function App() {
           <span className="brand-mark" aria-hidden="true"><i /><i /><i /></span>
           <span>backtrack</span>
         </a>
-        <div className="study-tag"><span className="status-dot" />LOW BACK PAIN STUDY</div>
-        <nav className="view-switch" aria-label="Application view">
-          <button type="button" className={view === 'patient' ? 'active' : ''} onClick={() => setView('patient')}>Patient</button>
-          <button type="button" className={view === 'research' ? 'active' : ''} onClick={() => setView('research')}>Researcher</button>
+        <div className="study-tag"><span className="status-dot" />LOW BACK PAIN STUDY · DEMO</div>
+        <nav className="view-switch" aria-label="Demo view">
+          <button type="button" className={view === 'patient' ? 'active' : ''} onClick={() => switchView('patient')}>Patient</button>
+          <button type="button" className={view === 'physiotherapist' ? 'active' : ''} onClick={() => switchView('physiotherapist')}>Physiotherapist</button>
+          <button type="button" className={view === 'research' ? 'active' : ''} onClick={() => switchView('research')}>Developer/Researcher</button>
         </nav>
-        <label className="participant-select">
-          <span>Participant</span>
-          <select value={selectedId} onChange={(event) => selectParticipant(event.target.value)} aria-label="Selected participant">
-            {participants.map((participant) => <option key={participant.id} value={participant.id}>{participant.id}</option>)}
-          </select>
-        </label>
+        {view === 'patient'
+          ? <span className="participant-select patient-id">Patient demo · {selected.id}</span>
+          : <label className="participant-select">
+            <span>Sample ID</span>
+            <select value={selected.id} onChange={(event) => selectParticipant(event.target.value)} aria-label="Selected synthetic participant">
+              {state.participants.map((participant) => <option key={participant.id} value={participant.id}>{participant.id}</option>)}
+            </select>
+          </label>}
       </header>
 
       <main>
+        <div className="draft-banner"><strong>PROPOSAL DEMO · DRAFT v0.3</strong><span>Not approved for patient care. Review by a licensed physiotherapist is required before use with patients.</span></div>
         <div className="page-heading">
-          <div>
-            <p className="eyebrow">HOME EXERCISE PROGRAM</p>
-            <h1>{view === 'patient' ? 'Your movement log' : 'Study overview'}</h1>
-          </div>
-          <p className="date-stamp">{dateLabel(today, { weekday: 'long', month: 'long', day: 'numeric' })}</p>
+          <div><p className="eyebrow">HOME EXERCISE PROGRAM</p><h1>{view === 'patient' ? 'Your movement log' : view === 'physiotherapist' ? 'Physiotherapist workspace' : 'Developer/research overview'}</h1></div>
+          <p className="date-stamp">{dateLabel(today, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })}</p>
         </div>
+
+        {notice && <div className="notice" role="status"><span>{notice}</span><button type="button" onClick={() => setNotice('')} aria-label="Dismiss message">×</button></div>}
 
         {view === 'patient' ? (
           <div className="patient-layout">
             <section className="panel today-panel" id="today">
-              <div className="panel-heading">
-                <div>
-                  <p className="eyebrow">TODAY · {dateLabel(today, { month: 'short', day: 'numeric' }).toUpperCase()}</p>
-                  <h2>{todayScheduled ? 'Prescribed session' : 'A pause in the plan'}</h2>
-                </div>
-                {todayScheduled && <span className={`session-state ${todayLog?.status ?? 'pending'}`}>{todayLog?.status === 'completed' ? 'Logged' : todayLog?.status === 'missed' ? 'Missed' : 'Due today'}</span>}
-              </div>
-
-              {!todayScheduled ? (
-                <div className="rest-day">
-                  <span className="rest-mark" aria-hidden="true">↗</span>
-                  <div>
-                    <h3>No session planned today</h3>
-                    <p>{nextDay ? `Next planned day: ${nextDay.label}` : 'No days are scheduled in this protocol yet.'}</p>
+              {!selected.baselineOdi ? (
+                <section className="onboarding">
+                  <div className="panel-heading"><div><p className="eyebrow">STEP 1 · BASELINE</p><h2>Enter ODI section scores</h2></div></div>
+                  <p className="muted-copy">Use the study-approved ODI form separately. This demo records section scores only; it does not reproduce questionnaire wording.</p>
+                  <div className="odi-grid">
+                    {SECTION_LABELS.map((label, index) => (
+                      <label key={label}>{label}<select value={odiDraft[index] ?? ''} onChange={(event) => updateOdiScore(setOdiDraft, odiDraft, index, event.target.value)}><option value="">Not entered</option>{[0, 1, 2, 3, 4, 5].map((score) => <option key={score} value={score}>{score}</option>)}</select></label>
+                    ))}
                   </div>
-                </div>
-              ) : todayLog && !editingCheckIn ? (
-                <div className="saved-checkin" aria-live="polite">
-                  <span className={`saved-mark ${todayLog.status}`} aria-hidden="true">{todayLog.status === 'completed' ? '✓' : '–'}</span>
-                  <div className="saved-copy">
-                    <h3>{todayLog.status === 'completed' ? 'Session recorded' : 'Missed session recorded'}</h3>
-                    <p>{todayLog.status === 'completed'
-                      ? `${selected.protocol.exercises.filter((exercise) => (todayLog.dose[exercise.id] ?? 0) > 0).length} exercises with dose recorded · effort ${todayLog.effort ?? 'not recorded'}/5`
-                      : todayLog.reason}</p>
-                  </div>
-                  <button className="text-button" type="button" onClick={() => setEditingCheckIn(true)}>Edit check-in</button>
-                </div>
+                  <p className="form-note">Score = total ÷ (answered sections × 5) × 100. Exactly one missing/not-applicable section uses a denominator of 45; two or more missing sections cannot be scored. A physiotherapist selects the demo programme.</p>
+                  {odiResult && <div className="result-card"><strong>ODI {odiResult.percentage}%</strong><span>{odiResult.programme ? `Draft reference category: ${PROGRAMMES[programmeNumber(odiResult.programme)].category}` : 'Outside the enrollment range (81–100%)'}</span></div>}
+                  <button className="primary-button" type="button" onClick={saveBaseline}>Save baseline ODI</button>
+                </section>
+              ) : !selected.programme ? (
+                <section className="onboarding">
+                  <div className="panel-heading"><div><p className="eyebrow">PATIENT PLAN · {selected.id}</p><h2>Waiting for physiotherapist assignment</h2></div></div>
+                  <p className="muted-copy">Your home-exercise plan will appear here after the physiotherapist demo assigns a severity programme and movement direction.</p>
+                  {baselineResult && <div className="result-card"><strong>Baseline ODI {baselineResult.percentage}%</strong><span>Saved for this synthetic demo. The physiotherapist sets the plan in this version.</span></div>}
+                  <p className="form-note">This screen is a simulated patient view. It cannot verify a user's identity or protect records.</p>
+                </section>
               ) : (
-                <form className="checkin-form" onSubmit={(event) => { event.preventDefault(); saveCheckIn('completed') }}>
-                  <div className="exercise-head"><span>EXERCISE</span><span>PRESCRIBED</span><span>DONE</span></div>
-                  {selected.protocol.exercises.length === 0 ? (
-                    <p className="empty-state">No exercises have been added to this protocol.</p>
-                  ) : selected.protocol.exercises.map((exercise) => {
-                    const target = exercise.sets * exercise.amount
-                    return (
-                      <div className="exercise-row" key={exercise.id}>
-                        <div className="exercise-name"><strong>{exercise.name || 'Unnamed exercise'}</strong><span>{exercise.sets} sets × {exercise.amount} {exercise.unit} / set</span></div>
-                        <span className="prescribed-dose">{target} {exercise.unit}</span>
-                        <label className="dose-entry"><span className="sr-only">{exercise.name || 'Exercise'} {exercise.unit} completed</span><input type="number" min="0" max={target} step="1" inputMode="numeric" value={doseDraft[exercise.id] ?? 0} onChange={(event) => setDoseDraft((current) => ({ ...current, [exercise.id]: Math.min(Math.max(Number(event.target.value), 0), target) }))} /><span>{exercise.unit}</span></label>
+                <>
+                  {!selected.baselineOdi && <details className="baseline-details"><summary>Record baseline ODI section scores</summary><p className="form-note">Enter scores from the separately approved ODI form. This demo does not display questionnaire wording.</p><div className="odi-grid">{SECTION_LABELS.map((label, index) => <label key={label}>{label}<select value={odiDraft[index] ?? ''} onChange={(event) => updateOdiScore(setOdiDraft, odiDraft, index, event.target.value)}><option value="">Not entered</option>{[0, 1, 2, 3, 4, 5].map((score) => <option key={score} value={score}>{score}</option>)}</select></label>)}</div><button className="primary-button" type="button" onClick={saveBaseline}>Save baseline ODI</button></details>}
+                  <div className="panel-heading">
+                    <div><p className="eyebrow">TODAY · {dateLabel(today, { month: 'short', day: 'numeric' }).toUpperCase()} · {selected.id}</p><h2>{currentProgramme?.name}</h2></div>
+                    <span className="session-state pending">Programme {selected.programme}</span>
+                  </div>
+                  <div className="programme-meta">
+                    <span>Baseline ODI {baselineResult?.percentage}%</span>
+                    <span>{currentProgramme?.schedule}</span>
+                    {selected.programme === 'A' && <span>Choose morning or evening session</span>}
+                  </div>
+                  {selected.programme === 'A' && <label className="inline-select">Session time<select value={slot} onChange={(event) => setSlot(event.target.value)}><option>Morning</option><option>Evening</option></select></label>}
+
+                  <section className="direction-panel">
+                    <div><p className="eyebrow">PHYSIOTHERAPIST-ASSIGNED MOVEMENT PREFERENCE</p><h3>{selected.direction ?? 'Not assigned'}</h3></div>
+                    <p>The physiotherapist selects the direction and matching protocol for this demo. The patient view cannot edit the prescription.</p>
+                    {selectedPreference && (
+                      <div className="preference-card"><strong>{selectedPreference.id} · {selectedPreference.name}</strong><p>{selectedPreference.instructions}</p><span>{currentProgramme?.preferenceDose}</span></div>
+                    )}
+                  </section>
+
+                  {selected.programme === 'D' && (
+                    <label className="inline-select session-kind">Today’s session type<select value={sessionKind} onChange={(event) => setSessionKind(event.target.value as 'aerobic' | 'strength')}><option value="strength">Strength + aerobic</option><option value="aerobic">Aerobic only</option></select></label>
+                  )}
+
+                  {selected.programme === 'B' && <p className="schedule-callout">In addition to this session, the draft schedule includes a second 10-minute walk later in the day.</p>}
+                  <div className="equipment-callout"><strong>Equipment / setup</strong><span>{currentProgramme?.equipment}</span></div>
+
+                  {selectedSession ? (
+                    <div className="saved-checkin"><span className="saved-mark completed">✓</span><div className="saved-copy"><h3>{selectedSession.status === 'completed' ? 'Session recorded' : selectedSession.status === 'partial' ? 'Partial session recorded' : selectedSession.status === 'stopped' ? 'Session stopped and flagged' : 'Session marked missed'}</h3><p>Pain {selectedSession.painBefore}/10 before · {selectedSession.painAfter}/10 after · {selectedSession.completedExerciseIds.length} exercises ticked</p></div><button className="text-button" type="button" onClick={() => updateSelected((participant) => ({ ...participant, sessions: participant.sessions.filter((session) => session.id !== selectedSession.id) }))}>Edit entry</button></div>
+                  ) : (
+                    <div className="session-entry">
+                      <CheckList title="Before each session: safety check" items={URGENT_SYMPTOMS} values={sessionDraft.urgentFlags} onChange={(urgentFlags) => updateSessionDraft({ urgentFlags })} />
+                      {sessionDraft.urgentFlags.length > 0 && <p className="alert-box" role="alert">Do not exercise. The draft protocol says to seek urgent care for any checked warning sign.</p>}
+                      <label className="pain-field">Pain before session (0–10)<input type="number" min="0" max="10" value={sessionDraft.painBefore} onChange={(event) => updateSessionDraft({ painBefore: Math.min(10, Math.max(0, Number(event.target.value))) })} /></label>
+                      <div className="exercise-list">
+                        <div className="subheading"><div><p className="eyebrow">SESSION EXERCISES</p><h3>Mark each exercise completed</h3></div><span>{activeExercises.length} items</span></div>
+                        {activeExercises.map((exercise) => (
+                          <label className="exercise-card" key={exercise.id}>
+                            <input type="checkbox" checked={sessionDraft.completedExerciseIds.includes(exercise.id)} onChange={(event) => updateSessionDraft({ completedExerciseIds: event.target.checked ? [...sessionDraft.completedExerciseIds, exercise.id] : sessionDraft.completedExerciseIds.filter((id) => id !== exercise.id) })} />
+                            <span className="exercise-copy"><strong>{exercise.isActivity ? exercise.name : `${exercise.id} · ${exercise.name}`}</strong><span>{exercise.instructions}</span><small>Draft dose: {exercise.dose}{exercise.optional ? ' · optional' : ''}</small>{!exercise.isActivity && <em>Media placeholder · {exercise.id}</em>}</span>
+                          </label>
+                        ))}
                       </div>
-                    )
-                  })}
-                  <div className="effort-row">
-                    <div><strong>How did the session feel?</strong><span>Perceived effort</span></div>
-                    <div className="effort-scale" role="group" aria-label="Perceived effort from 1 to 5">
-                      {[1, 2, 3, 4, 5].map((level) => <button type="button" key={level} className={effort === level ? 'selected' : ''} aria-pressed={effort === level} onClick={() => setEffort(level)}>{level}</button>)}
+                      <CheckList title="Stop-session flags" items={DAILY_STOP_FLAGS} values={sessionDraft.stopFlags} onChange={(stopFlags) => updateSessionDraft({ stopFlags })} />
+                      <label className="pain-field">Pain after session (0–10)<input type="number" min="0" max="10" value={sessionDraft.painAfter} onChange={(event) => updateSessionDraft({ painAfter: Math.min(10, Math.max(0, Number(event.target.value))) })} /></label>
+                      {sessionDraft.stopFlags.length > 0 && <p className="alert-box" role="alert">Stop the exercise. This is recorded as stopped, not completed. Follow the draft’s clinician/urgent-care guidance.</p>}
+                      <div className="checkin-actions"><button className="primary-button" type="button" onClick={() => saveSession('completed')} disabled={sessionDraft.urgentFlags.length > 0}>Record completed session</button><button className="text-button" type="button" onClick={() => saveSession('partial')} disabled={sessionDraft.urgentFlags.length > 0}>Save partial session</button><button className="text-button missed-button" type="button" onClick={() => saveSession('missed')} disabled={sessionDraft.urgentFlags.length > 0}>Mark missed</button></div>
+                      <p className="form-note">Ticks, pain scores, and adherence are self-reported synthetic demo data. Stop flags are not a diagnostic tool.</p>
                     </div>
-                  </div>
-                  <div className="checkin-actions">
-                    <button className="primary-button" type="submit">Save completed session</button>
-                    <label className="missed-reason"><span>Reason if missed</span><select value={missReason} onChange={(event) => setMissReason(event.target.value)}><option>Schedule conflict</option><option>Forgot</option><option>Not feeling well</option><option>Other</option></select></label>
-                    <button className="text-button missed-button" type="button" onClick={() => saveCheckIn('missed')}>Mark missed</button>
-                  </div>
-                  <p className="form-note">Completion and exercise amounts are self-reported.</p>
-                </form>
+                  )}
+
+                  <details className="guidance-details"><summary>Draft modality precautions and clinician guidance</summary><ul>{MODALITY_GUIDANCE.map((item) => <li key={item}>{item}</li>)}</ul><p><strong>Contact a clinician (draft guidance):</strong></p><ul>{CONTACT_CLINICIAN_GUIDANCE.map((item) => <li key={item}>{item}</li>)}</ul><p>Draft precautions include pregnancy, heart or lung disease, reduced skin sensation, a known rigid/fused spine, or osteoporosis. A clinician should review these before exercise or modality use.</p></details>
+                  {eligibleNextProgramme && <div className="progression-card"><div><strong>Draft progression criteria met</strong><span>Programme {eligibleNextProgramme} applies from your next session after the current entry is saved.</span></div></div>}
+                  <div className="progression-note"><strong>Programme progression</strong><span>Minimum 2 weeks, all exercises in the last 3 sessions ticked, and the draft pain criteria met. Progression is a demo calculation, not clinical approval.</span></div>
+                  {showFinalOdi ? (
+                    <section className="onboarding final-odi">
+                      <h3>End-of-course ODI scores</h3>
+                      <div className="odi-grid">{SECTION_LABELS.map((label, index) => <label key={label}>{label}<select value={finalOdiDraft[index] ?? ''} onChange={(event) => updateOdiScore(setFinalOdiDraft, finalOdiDraft, index, event.target.value)}><option value="">Not entered</option>{[0, 1, 2, 3, 4, 5].map((score) => <option key={score} value={score}>{score}</option>)}</select></label>)}</div>
+                      <button className="primary-button" type="button" onClick={saveFinalOdi}>Save end ODI</button>
+                    </section>
+                  ) : endOdiAvailable && (
+                    <button className="text-button final-odi-button" type="button" onClick={() => setShowFinalOdi(true)}>{finalResult ? `End ODI ${finalResult.percentage}% · change ${finalResult.percentage - (baselineResult?.percentage ?? 0)} points` : 'Complete end-of-course ODI'}</button>
+                  )}
+                </>
               )}
             </section>
 
             <aside className="patient-aside">
               <section className="panel adherence-panel">
-                <div className="panel-heading compact-heading"><div><p className="eyebrow">LAST 7 DAYS</p><h2>Adherence snapshot</h2></div></div>
-                <div className="metric-pair">
-                  <div className="metric"><span>Sessions</span><strong>{summary.sessionRate === null ? '—' : `${summary.sessionRate}%`}</strong><small>{summary.completed} of {summary.scheduled} scheduled</small></div>
-                  <div className="metric dose-metric"><span>Exercise dose</span><strong>{summary.doseRate === null ? '—' : `${summary.doseRate}%`}</strong><small>mean reported dose per exercise</small></div>
-                </div>
-                <div className="week-strip" aria-label="Prescribed days in the last seven days">
-                  {Array.from({ length: 7 }, (_, index) => dateAtOffset(index - 6, today)).map((date) => {
-                    const log = selected.logs.find((item) => item.date === dateKey(date))
-                    const scheduled = selected.protocol.days.includes(date.getDay())
-                    return <div className="week-day" key={dateKey(date)}><span>{dateLabel(date, { weekday: 'narrow' })}</span><i className={`${scheduled ? 'scheduled' : ''} ${log?.status ?? ''}`} aria-label={scheduled ? log?.status ?? 'scheduled, not logged' : 'not scheduled'} /></div>
-                  })}
-                </div>
-                <p className="metric-footnote">Sessions count a saved completion. Dose is the mean of each reported exercise amount ÷ its prescribed amount; missing sessions count as 0%.</p>
+                <div className="panel-heading compact-heading"><div><p className="eyebrow">LAST 7 DAYS</p><h2>Adherence snapshot</h2></div><span className="self-report-tag">DEMO</span></div>
+                <div className="metric"><span>Completed sessions</span><strong>{adherenceRate}%</strong><small>{adherenceCount} logged / {adherenceTarget} target sessions this week</small></div>
+                {selected.programme === 'D' && <div className="programme-adherence"><span>Strength sessions: {lastSevenDays.filter((session) => session.status === 'completed' && session.kind === 'strength').length}/3</span><span>Aerobic days: {lastSevenDays.filter((session) => session.status === 'completed').length}/5</span></div>}
+                <div className="metric"><span>Exercise ticks in this entry</span><strong>{exerciseTickRate}%</strong><small>{exerciseTickCount} / {requiredExerciseCount} required items ticked</small></div>
+                <div className="week-strip">{lastSevenDays.slice(-7).map((session) => <span className={`session-chip ${session.status}`} key={session.id} title={`${session.date}: ${session.status}`}>{dateLabel(parseDate(session.date), { weekday: 'short' }).slice(0, 1)}</span>)}</div>
+                <p className="metric-footnote">Session adherence uses the draft weekly target: A 14, B 6, C 5, D 5. This rolling count is for demonstration only.</p>
               </section>
-              <section className="protocol-summary">
-                <p className="eyebrow">YOUR SCHEDULE</p>
-                <div className="schedule-pills">{WEEKDAYS.filter((day) => selected.protocol.days.includes(day.day)).map((day) => <span key={day.day}>{day.label}</span>)}{selected.protocol.days.length === 0 && <span className="muted">No days set</span>}</div>
-                <p>{selected.protocol.exercises.length} prescribed {selected.protocol.exercises.length === 1 ? 'exercise' : 'exercises'}</p>
+              <section className="panel programme-card">
+                <p className="eyebrow">PHYSIOTHERAPIST-ASSIGNED PLAN</p>
+                {currentProgramme ? <><h2>Programme {currentProgramme.id}</h2><p>{currentProgramme.category} · {currentProgramme.focus}</p></> : <><h2>Not enrolled</h2><p>ODI 81–100% is outside the draft enrollment range.</p></>}
+                {baselineResult && <small>Baseline ODI {baselineResult.percentage}% · {baselineResult.answered}/10 sections scored</small>}
+                {selected.direction && <small>Preferred direction: {selected.direction}</small>}
               </section>
+              <section className="panel equipment-card"><p className="eyebrow">COURSE</p><h2>{courseDays} / 84 days</h2><div className="course-track"><i style={{ width: `${Math.min(100, Math.round((courseDays / 84) * 100))}%` }} /></div><small>12-week draft course · minimum 2 weeks in each programme</small></section>
+              <button className="text-button reset-button" type="button" onClick={resetDemo}>Reset synthetic demo data</button>
             </aside>
+          </div>
+        ) : view === 'physiotherapist' ? (
+          <div className="therapist-layout">
+            <aside className="panel therapist-patients">
+              <div className="panel-heading"><div><p className="eyebrow">AUTHORIZED DEMO LIST</p><h2>Sample patients</h2></div><span className="self-report-tag">SIMULATED</span></div>
+              <p className="muted-copy">Synthetic records only. This list is not protected by therapist authentication or assignment checks.</p>
+              <div className="participant-rows">{state.participants.map((participant) => <button type="button" key={participant.id} className={`participant-row ${participant.id === selected.id ? 'selected' : ''}`} onClick={() => selectParticipant(participant.id)}><span className="participant-avatar">{participant.id.slice(-2)}</span><span className="participant-meta"><strong>{participant.id}</strong><small>{participant.programme ? `Programme ${participant.programme} · ${participant.sessions.length} logs` : 'Awaiting plan'}</small></span></button>)}</div>
+              <button className="add-participant" type="button" onClick={addSyntheticParticipant}><span aria-hidden="true">+</span> Add synthetic patient</button>
+            </aside>
+            <section className="panel therapist-workspace">
+              <div className="panel-heading"><div><p className="eyebrow">PHYSIOTHERAPIST DEMO · PT-01</p><h2>Review and assign plan</h2></div><span className="session-state pending">{selected.id}</span></div>
+              <div className="therapist-assessment">
+                <div className="assessment-stat"><span>Baseline ODI</span><strong>{baselineResult ? `${baselineResult.percentage}%` : 'Not recorded'}</strong><small>{baselineResult ? `${baselineResult.answered}/10 sections` : 'Patient demo may enter a baseline score'}</small></div>
+                <div className="assessment-stat"><span>Logged sessions</span><strong>{selected.sessions.length}</strong><small>{selected.sessions.filter((session) => session.status === 'stopped').length} stopped/flagged</small></div>
+                <div className="assessment-stat"><span>Latest pain</span><strong>{selected.sessions.length ? `${[...selected.sessions].sort((a, b) => b.date.localeCompare(a.date))[0].painAfter}/10` : '—'}</strong><small>After-session self-report</small></div>
+              </div>
+              {baselineResult && baselineResult.percentage > 80 && <p className="alert-box">The supplied protocol draft excludes ODI 81–100%. Do not assign a plan in this demo.</p>}
+              <div className="plan-controls">
+                <label>Severity programme<select value={programmeDraft} onChange={(event) => setProgrammeDraft(event.target.value as Programme)}>{PROGRAMMES.map((programme) => <option key={programme.id} value={programme.id}>{programme.category} · Programme {programme.id} · ODI {programme.odiRange}%</option>)}</select></label>
+                <label>McKenzie directional preference<select value={directionDraft} onChange={(event) => setDirectionDraft(event.target.value as Direction)}>{DIRECTIONS.map((direction) => <option key={direction} value={direction}>{direction === 'None' ? 'None / skip' : direction}</option>)}</select></label>
+              </div>
+              {programmeDraft !== 'D' && directionDraft !== 'None' && PROGRAMMES[programmeNumber(programmeDraft)].preference[directionDraft] && (
+                <div className="preference-card therapist-preview"><strong>{PROGRAMMES[programmeNumber(programmeDraft)].preference[directionDraft]?.id} · {PROGRAMMES[programmeNumber(programmeDraft)].preference[directionDraft]?.name}</strong><p>{PROGRAMMES[programmeNumber(programmeDraft)].preference[directionDraft]?.instructions}</p><span>{PROGRAMMES[programmeNumber(programmeDraft)].preferenceDose}</span></div>
+              )}
+              <div className="protocol-reference"><h3>Preset protocol preview</h3><p><strong>{PROGRAMMES[programmeNumber(programmeDraft)].name}</strong> · {PROGRAMMES[programmeNumber(programmeDraft)].focus}</p><p>{PROGRAMMES[programmeNumber(programmeDraft)].schedule}</p><p>{PROGRAMMES[programmeNumber(programmeDraft)].exercises.length} protocol items · {PROGRAMMES[programmeNumber(programmeDraft)].equipment}</p></div>
+              <label className="clinical-note-field">Clinical decision / demo note<textarea rows={3} value={clinicalNoteDraft} onChange={(event) => setClinicalNoteDraft(event.target.value)} placeholder="Synthetic example note only" /></label>
+              <div className="study-actions"><button className="primary-button" type="button" onClick={assignPlan} disabled={Boolean(baselineResult && baselineResult.percentage > 80)}>Assign demo plan to patient view</button><span className="form-note">In this prototype, assignment is saved in this browser only and has no audit trail.</span></div>
+              <div className="study-actions"><button className="text-button" type="button" onClick={() => previewPatient(selected.id)}>Preview this synthetic patient view</button></div>
+              <div className="table-wrap"><table><thead><tr><th>Date</th><th>Programme</th><th>Status</th><th>Pain before</th><th>Pain after</th><th>Exercise ticks</th><th>Safety flags</th></tr></thead><tbody>
+                {selected.sessions.length === 0 ? <tr><td colSpan={7}>No synthetic session records yet.</td></tr> : selected.sessions.map((session) => <tr key={session.id}><td>{session.date}</td><td>{session.programme}</td><td>{session.status}</td><td>{session.painBefore}</td><td>{session.painAfter}</td><td>{session.completedExerciseIds.length}</td><td>{session.stopFlags.length}</td></tr>)}
+              </tbody></table></div>
+            </section>
           </div>
         ) : (
           <div className="research-layout">
-            <aside className="participant-list panel">
-              <div className="panel-heading list-heading"><div><p className="eyebrow">COHORT</p><h2>Participants <span className="count-badge">{participants.length}</span></h2></div></div>
-              <div className="participant-rows">
-                {participants.map((participant) => {
-                  const participantSummary = getWeekSummary(participant, today)
-                  return <button type="button" key={participant.id} className={`participant-row ${participant.id === selectedId ? 'selected' : ''}`} onClick={() => selectParticipant(participant.id)}><span className="participant-avatar">{participant.id.slice(-2)}</span><span className="participant-meta"><strong>{participant.id}</strong><small>{participant.protocol.exercises.length} exercises · {participant.protocol.days.length} days / week</small></span><span className="participant-rate">{participantSummary.sessionRate === null ? '—' : `${participantSummary.sessionRate}%`}</span></button>
-                })}
+            <section className="panel study-panel">
+              <div className="section-title"><div><p className="eyebrow">SYNTHETIC COHORT · DEVELOPER/RESEARCHER DEMO</p><h2>Proposal demonstration summary</h2></div><span className="self-report-tag">NOT PROTECTED</span></div>
+              <p className="muted-copy">This simulated dashboard is not restricted to a developer ID. The local prototype has no login, backend, authorization, or audit trail; do not treat this view as a protected researcher role.</p>
+              <div className="therapist-assessment research-summary">
+                <div className="assessment-stat"><span>Synthetic participants</span><strong>{state.participants.length}</strong><small>IDs only</small></div>
+                <div className="assessment-stat"><span>Sessions completed</span><strong>{state.participants.reduce((count, item) => count + item.sessions.filter((session) => session.status === 'completed').length, 0)}</strong><small>Self-reported logs</small></div>
+                <div className="assessment-stat"><span>Missing baseline ODI</span><strong>{state.participants.filter((item) => !getOdiResult(item.baselineOdi)).length}</strong><small>Sample cohort</small></div>
               </div>
-              <button className="add-participant" type="button" onClick={addParticipant}><span aria-hidden="true">+</span> Add participant</button>
-              <p className="sample-note">Demo participants use pseudonymous sample data.</p>
-            </aside>
-
-            <div className="research-main">
-              <section className="metrics-section">
-                <div className="section-title"><div><p className="eyebrow">{selected.id} · ROLLING 7 DAYS</p><h2>Adherence at a glance</h2></div><span className="self-report-tag">SELF-REPORTED</span></div>
-                <div className="research-metrics">
-                  <div className="research-metric session-card"><span>Sessions completed</span><strong>{summary.sessionRate === null ? '—' : `${summary.sessionRate}%`}</strong><small>{summary.completed} completed / {summary.scheduled} scheduled sessions</small><div className="metric-track"><i style={{ width: `${summary.sessionRate ?? 0}%` }} /></div></div>
-                  <div className="research-metric dose-card"><span>Mean exercise dose completed</span><strong>{summary.doseRate === null ? '—' : `${summary.doseRate}%`}</strong><small>mean reported amount / prescribed target per exercise</small><div className="metric-track"><i style={{ width: `${summary.doseRate ?? 0}%` }} /></div></div>
-                </div>
-                <div className="trend-panel">
-                  <div className="trend-heading"><div><h3>Session completion trend</h3><p>Completed sessions ÷ scheduled sessions by week</p></div><span>6 WEEKS</span></div>
-                  <div className="trend-chart" role="img" aria-label="Six week session completion trend">
-                    {trend.map((week) => <div className="trend-column" key={week.label}><div className="bar-track"><i style={{ height: `${week.rate ?? 0}%` }} /></div><strong>{week.rate === null ? '—' : `${week.rate}%`}</strong><span>{week.label}</span></div>)}
-                  </div>
-                </div>
-              </section>
-
-              <section className="protocol-editor panel">
-                <div className="panel-heading editor-heading"><div><p className="eyebrow">PARTICIPANT PROTOCOL</p><h2>Prescribed plan</h2></div><span className="autosave-label"><i />Saved on this device</span></div>
-                <fieldset className="schedule-editor"><legend>Scheduled days</legend><div className="day-toggles">{WEEKDAYS.map((day) => <label key={day.day} className={selected.protocol.days.includes(day.day) ? 'checked' : ''}><input type="checkbox" checked={selected.protocol.days.includes(day.day)} onChange={() => updateProtocol({ days: selected.protocol.days.includes(day.day) ? selected.protocol.days.filter((item) => item !== day.day) : [...selected.protocol.days, day.day] })} /><span>{day.label}</span></label>)}</div></fieldset>
-                <div className="editor-exercises">
-                  <div className="editor-label-row"><span>EXERCISE</span><span>SETS</span><span>AMOUNT / SET</span><span>UNIT</span><span /></div>
-                  {selected.protocol.exercises.map((exercise) => <div className="editor-exercise" key={exercise.id}><label><span className="sr-only">Exercise name</span><input value={exercise.name} placeholder="Exercise name" onChange={(event) => updateExercise(exercise.id, { name: event.target.value })} /></label><label><span className="sr-only">Sets</span><input type="number" min="1" max="20" value={exercise.sets} onChange={(event) => updateExercise(exercise.id, { sets: Math.max(1, Number(event.target.value)) })} /></label><label><span className="sr-only">Amount per set</span><input type="number" min="1" max="999" value={exercise.amount} onChange={(event) => updateExercise(exercise.id, { amount: Math.max(1, Number(event.target.value)) })} /></label><label><span className="sr-only">Unit</span><select value={exercise.unit} onChange={(event) => updateExercise(exercise.id, { unit: event.target.value as Exercise['unit'] })}><option value="reps">reps</option><option value="seconds">seconds</option></select></label><button className="remove-exercise" type="button" aria-label={`Remove ${exercise.name || 'exercise'}`} onClick={() => updateProtocol({ exercises: selected.protocol.exercises.filter((item) => item.id !== exercise.id) })}>Remove</button></div>)}
-                </div>
-                <button className="add-exercise" type="button" onClick={addExercise}>+ Add exercise</button>
-                <p className="protocol-note">Protocol edits affect this participant only. Research use should define how protocol changes are handled before data collection.</p>
-              </section>
-            </div>
+              <div className="table-wrap"><table><thead><tr><th>Sample ID</th><th>Baseline ODI</th><th>Draft programme</th><th>Direction</th><th>Logged sessions</th></tr></thead><tbody>
+                {state.participants.map((participant) => {
+                  const result = getOdiResult(participant.baselineOdi)
+                  return <tr key={participant.id}><td><button className="text-button" type="button" onClick={() => { selectParticipant(participant.id); setView('physiotherapist') }}>{participant.id}</button></td><td>{result ? `${result.percentage}%` : 'Not assessed'}</td><td>{participant.programme ? `Programme ${participant.programme}` : 'Not assigned'}</td><td>{participant.direction ?? 'Not selected'}</td><td>{participant.sessions.filter((session) => session.status === 'completed').length}</td></tr>
+                })}
+              </tbody></table></div>
+              <div className="study-actions"><button className="primary-button" type="button" onClick={exportSyntheticCsv}>Export synthetic demo CSV</button><button className="text-button" type="button" onClick={addSyntheticParticipant}>+ New synthetic participant</button><button className="text-button" type="button" onClick={resetDemo}>Reset sample cohort</button></div>
+              <div className="protocol-reference"><h3>ODI category rules in the supplied draft</h3><ul>{PROGRAMMES.map((programme) => <li key={programme.id}><strong>{programme.odiRange}%</strong> · {programme.category} · Programme {programme.id}: {programme.name}</li>)}<li><strong>81–100%</strong> · Not enrolled by this draft</li></ul></div>
+            </section>
           </div>
         )}
 
-        <footer className="disclaimer"><span className="disclaimer-mark" aria-hidden="true">i</span><p><strong>Study prototype.</strong> Entries are self-reported and stored only in this browser. This tool is not for clinical decision-making; do not enter identifiable patient information.</p></footer>
+        <footer className="disclaimer"><span className="disclaimer-mark" aria-hidden="true">!</span><p><strong>Unapproved protocol draft for proposal demonstration.</strong> Use only synthetic data. It is not medical advice, a diagnostic tool, or for clinical decisions. ODI question wording and media are not included; use only approved materials. Therapist review is required before any patient use.</p></footer>
       </main>
     </div>
   )
